@@ -1,0 +1,6 @@
+name: llms-in-prod
+cluster_env: dev-llms:6
+ray_serve_config:
+  import_path: 1-hello-chat:entrypoint
+  runtime_env:
+    working_dir: .
