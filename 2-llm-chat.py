@@ -1,33 +1,127 @@
-import ray
+from typing import Optional, Any, Dict
+from operator import add
 import requests, json
 from starlette.requests import Request
-from typing import Dict
+import numpy as np
+import torch
+
+from sentence_transformers import SentenceTransformer
+from langchain.embeddings.base import Embeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.document_loaders import WikipediaLoader
+from langchain import HuggingFacePipeline
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
+
+from transformers import pipeline as hf_pipeline
+
+import ray
 from ray import serve
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-@serve.deployment(ray_actor_options={'num_gpus': 0.5})
-class Chat:
-    def __init__(self, model: str):
-        # configure stateful elements of our service such as loading a model
-        self._tokenizer = AutoTokenizer.from_pretrained(model)
-        self._model =  AutoModelForSeq2SeqLM.from_pretrained(model).to(0)
+class LocalHuggingFaceEmbeddings(Embeddings):
+    def __init__(self, model_id):
+        self.model = SentenceTransformer(model_id)
 
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        embeddings = self.model.encode(texts)
+        return embeddings
+
+    def embed_query(self, text: str) -> list[float]:
+        embedding = self.model.encode(text)
+        return list(map(float, embedding))
+    
+class StableLMPipeline(HuggingFacePipeline): 
+    # Class is temporary, we are working with the authors of LangChain to make these unnecessary.
+    
+    def _call(self, prompt: str, stop: Optional[list[str]] = None) -> str:
+        response = self.pipeline(prompt, temperature=0.1, max_new_tokens=256, do_sample=True)
+        print(f"Response is: {response}")
+        text = response[0]["generated_text"][len(prompt) :]
+        return text
+
+    @classmethod
+    def from_model_id(cls, model_id: str, task: str, device: Optional[str] = None, model_kwargs: Optional[dict] = None, **kwargs: Any,):
+        pipeline = hf_pipeline(model=model_id, task=task, device=device, model_kwargs=model_kwargs, )
+        return cls(pipeline=pipeline, model_id=model_id, model_kwargs=model_kwargs, **kwargs, )
+    
+template = """
+<|SYSTEM|># StableLM Tuned (Alpha version)
+- You are a helpful, polite, fact-based agent for answering questions. 
+- Your answers include enough detail for someone to follow through on your suggestions. 
+<|USER|>
+If you don't know the answer, just say that you don't know. Don't try to make up an answer.
+Please answer the following question using the context provided. 
+
+CONTEXT: 
+{context}
+=========
+QUESTION: {question} 
+ANSWER: <|ASSISTANT|>"""
+
+PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
+
+@serve.deployment
+class ParallelBuildVectorDBDeployment:
+    FAISS_INDEX_PATH = "/home/ray/faiss_dist_built_index"
+
+    def __init__(self):
+        self.embeddings = LocalHuggingFaceEmbeddings("multi-qa-mpnet-base-dot-v1")
+        try:
+            self.db = FAISS.load_local(self.FAISS_INDEX_PATH, self.embeddings)
+        except:
+            self.setup_db()
+            
+    def setup_db(self):
+        topics = ['The Eras Tour', '2023 XFL season']
+        loaders = [WikipediaLoader(query=topic, load_max_docs=20) for topic in topics]
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=20, length_function=len,)
+        docs = add(*[loader.load() for loader in loaders])
+        print([d.metadata['title'] for d in docs])
+        chunks = text_splitter.create_documents([doc.page_content for doc in docs], metadatas=[doc.metadata for doc in docs])
+        db_shards = 8
+        print(f"Loading chunks into vector store ... using {db_shards} shards")
+        shards = np.array_split(chunks, db_shards)
+        
+        @ray.remote
+        def process_shard(shard):
+            embeddings = LocalHuggingFaceEmbeddings("multi-qa-mpnet-base-dot-v1")
+            result = FAISS.from_documents(shard, embeddings)
+            return result
+        
+        futures = [process_shard.remote(shards[i]) for i in range(db_shards)]
+        results = ray.get(futures)
+        self.db = results[0]
+        for i in range(1, db_shards):
+            self.db.merge_from(results[i])
+        self.db.save_local(self.FAISS_INDEX_PATH)
+        
+    def similarity_search(self, query):
+        return self.db.similarity_search(query)
+
+@serve.deployment(ray_actor_options={"num_gpus": 1.0})
+class QADeployment:
+    def __init__(self, db):
+        self.embeddings = LocalHuggingFaceEmbeddings("multi-qa-mpnet-base-dot-v1")
+        self.db = db
+        self.llm = StableLMPipeline.from_model_id(
+            model_id="stabilityai/stablelm-tuned-alpha-7b",
+            task="text-generation",
+            model_kwargs={"torch_dtype": torch.float16, "device_map": "auto", 'cache_dir':'/mnt/local_storage'}
+        )
+        self.chain = load_qa_chain(llm=self.llm, chain_type="stuff", prompt=PROMPT)
+
+    async def qa(self, query):
+        search_results_ref = await self.db.similarity_search.remote(query)
+        search_results = await search_results_ref
+        result = self.chain({"input_documents": search_results, "question": query})
+        return result["output_text"]
+    
     async def __call__(self, request: Request) -> Dict:
-        # path to handle HTTP requests
         data = await request.json()
         data = json.loads(data)
-        # after decoding the payload, we delegate to get_response for logic
-        return {'response': self.get_response(data['user_input'], data['history']) }
-    
-    def get_response(self, user_input: str, history: list[str]) -> str:
-        # this method receives calls directly (from Python) or from __call__ (from HTTP)
-        history.append(user_input)
-        # the history is client-side state and will be a list of raw strings;
-        # for the default config of the model and tokenizer, history should be joined with '</s><s>'
-        inputs = self._tokenizer('</s><s>'.join(history), return_tensors='pt').to(0)
-        reply_ids = self._model.generate(**inputs, max_new_tokens=500)
-        response = self._tokenizer.batch_decode(reply_ids.cpu(), skip_special_tokens=True)[0]
-        return response
-    
-entrypoint = Chat.bind(model='facebook/blenderbot-400M-distill')
+        output = await self.qa(data['user_input'])
+        return {"result": output }
 
+vecdb_deployment = ParallelBuildVectorDBDeployment.bind()
+entrypoint = QADeployment.bind(vecdb_deployment)
