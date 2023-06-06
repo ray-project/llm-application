@@ -1,6 +1,6 @@
 name: llms-in-prod
 cluster_env: dev-llms:6
-compute_config: dev-1-node-gpu
+compute_config: llm-2-3-node-gpu
 ray_serve_config:
   import_path: 2-llm-chat:entrypoint
   runtime_env:
