@@ -61,7 +61,7 @@ ANSWER: <|ASSISTANT|>"""
 
 PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
 
-@serve.deployment
+@serve.deployment(autoscaling_config={"min_replicas": 1, "initial_replicas": 2, "max_replicas": 5})
 class ParallelBuildVectorDBDeployment:
     FAISS_INDEX_PATH = "/home/ray/faiss_dist_built_index"
 
@@ -99,7 +99,7 @@ class ParallelBuildVectorDBDeployment:
     def similarity_search(self, query):
         return self.db.similarity_search(query)
 
-@serve.deployment(ray_actor_options={"num_gpus": 1.0})
+@serve.deployment(ray_actor_options={"num_gpus": 1.0}, num_replicas=2)
 class QADeployment:
     def __init__(self, db):
         self.embeddings = LocalHuggingFaceEmbeddings("multi-qa-mpnet-base-dot-v1")
